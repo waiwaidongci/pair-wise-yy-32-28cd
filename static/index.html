@@ -1,1 +1,97 @@
-<!doctype html><html lang="zh-CN"><meta charset="utf-8"><title>批次放行</title><style>body{font:16px system-ui;max-width:1100px;margin:32px auto;padding:0 20px}pre{background:#f3f5f7;padding:16px;overflow:auto}button{padding:8px 14px}</style><h1>药品生产偏差与批次放行</h1><p>偏差、检验、返工、供应商变更和稳定性数据共同约束质量放行。</p><button onclick="loadState()">刷新状态</button><pre id="state">加载中...</pre><script>async function loadState(){state.textContent=JSON.stringify(await (await fetch('/api/state')).json(),null,2)}loadState()</script></html>
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>批次放行凭据</title>
+<style>
+  body{font:14px/1.6 system-ui,"PingFang SC","Microsoft YaHei",sans-serif;max-width:1180px;margin:24px auto;padding:0 20px;color:#1f2933}
+  h1{font-size:22px} h2{font-size:16px;margin:0 0 6px}
+  button{padding:6px 14px;cursor:pointer}
+  .muted{color:#6b7280;font-size:12px}
+  .card{border:1px solid #d7dde3;border-radius:8px;padding:14px 16px;margin:12px 0;background:#fff}
+  .badges{display:flex;gap:8px;flex-wrap:wrap;margin:4px 0}
+  .badge{padding:2px 10px;border-radius:999px;font-size:12px;font-weight:600}
+  .b-released{background:#dcfce7;color:#166534}.b-conditional{background:#fef9c3;color:#854d0e}
+  .b-awaiting_review{background:#ffedd5;color:#9a3412}.b-rejected{background:#fee2e2;color:#991b1b}
+  .b-other{background:#e5e7eb;color:#374151}
+  .cred{background:#f0fdf4;border:1px solid #86efac;border-radius:6px;padding:8px 10px;margin-top:8px}
+  .cred-dead{background:#fef2f2;border-color:#fca5a5}
+  ul.block,ul.reason{margin:6px 0;padding-left:20px}
+  .block li{color:#b91c1c}.reason li{color:#9a3412}
+  .meta{font-size:12px;color:#6b7280;display:flex;gap:16px;flex-wrap:wrap}
+  pre{background:#f3f5f7;padding:12px;border-radius:6px;overflow:auto;font-size:12px;max-height:300px}
+  details summary{cursor:pointer;color:#2563eb;font-size:12px}
+</style>
+</head>
+<body>
+<h1>药品生产偏差与批次放行</h1>
+<p class="muted">签发时冻结批次修订号及偏差、检验、返工、供应商变更、稳定性清单；任一依据补录或更正后，放行凭据失效并退回待复核。重试请携带同一 <code>X-Request-Id</code>。</p>
+<button onclick="loadState()">刷新状态</button>
+<div id="root">加载中...</div>
+<details><summary>原始 JSON（/api/state）</summary><pre id="raw"></pre></details>
+
+<script>
+const STATE_LABELS = {manufactured:"已生产", investigation:"调查中", awaiting_resample:"待再取样",
+  conditional:"有条件放行", released:"已放行", rejected:"已拒收", awaiting_review:"待复核"};
+
+function el(tag, cls, text){const e=document.createElement(tag); if(cls)e.className=cls; if(text!=null)e.textContent=text; return e;}
+
+function blockersUl(blockers){
+  const ul=el("ul","block");
+  if(!blockers||!blockers.length){ul.appendChild(el("li","","当前无阻塞项")); ul.firstChild.style.color="#166534"; return ul;}
+  blockers.forEach(b=>ul.appendChild(el("li","",b.message)));
+  return ul;
+}
+
+function reasonsUl(invalidation){
+  const ul=el("ul","reason");
+  (invalidation.reasons||[]).forEach(r=>ul.appendChild(el("li","",r.detail)));
+  return ul;
+}
+
+function batchCard(b){
+  const card=el("div","card");
+  const head=el("div","");
+  head.appendChild(el("h2","",`#${b.id} ${b.batch_no} · ${b.product}`));
+  const badges=el("div","badges");
+  const st = b.state==="released"||b.state==="conditional" ? `b-${b.state}`
+    : b.state==="awaiting_review"||b.state==="rejected" ? `b-${b.state}` : "b-other";
+  badges.appendChild(el("span",`badge ${st}`,STATE_LABELS[b.state]||b.state));
+  badges.appendChild(el("span","badge b-other",`修订号 ${b.revision}`));
+  head.appendChild(badges);
+  card.appendChild(head);
+
+  const meta=el("div","meta");
+  meta.appendChild(el("span","",`工厂 ${b.factory_id} · 生产日期 ${b.mfg_date} · 有效期 ${b.expiry_date}`));
+  card.appendChild(meta);
+
+  if(b.credential){
+    const live = b.credential.status==="active";
+    const c=el("div", live?"cred":"cred cred-dead");
+    c.appendChild(el("strong","",`放行凭据 ${b.credential.credential_no}（${live?"有效，可发运":"已失效"}）`));
+    c.appendChild(el("div","muted",`签发 ${b.credential.issued_at}`));
+    card.appendChild(c);
+  }
+
+  if(b.last_invalidation){
+    const inv=b.last_invalidation;
+    card.appendChild(el("strong","",`最近失效：凭据 ${inv.credential_no} — ${inv.trigger_action}（${inv.at}，${inv.triggered_by}）`));
+    card.appendChild(reasonsUl(inv));
+  }
+
+  card.appendChild(el("h2","","放行阻塞项"));
+  card.appendChild(blockersUl(b.release_blockers));
+  return card;
+}
+
+async function loadState(){
+  const data=await (await fetch("/api/state")).json();
+  document.getElementById("raw").textContent=JSON.stringify(data,null,2);
+  const root=document.getElementById("root"); root.textContent="";
+  if(!data.batches.length){root.appendChild(el("p","muted","暂无批次"));return;}
+  data.batches.forEach(b=>root.appendChild(batchCard(b)));
+}
+loadState();
+</script>
+</body>
+</html>
