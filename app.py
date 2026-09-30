@@ -9,7 +9,7 @@ import sys
 from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from urllib.parse import urlparse
+from urllib.parse import parse_qs, urlparse
 
 DB_PATH = Path(__file__).with_name("data.db")
 
@@ -32,8 +32,8 @@ def j(value: object) -> str:
 
 
 class ApiError(Exception):
-    def __init__(self, status: int, message: str):
-        super().__init__(message); self.status, self.message = status, message
+    def __init__(self, status: int, message: str, payload: dict | None = None):
+        super().__init__(message); self.status, self.message = status, message; self.payload = payload or {}
 
 
 class Store:
@@ -50,7 +50,7 @@ class Store:
         CREATE TABLE IF NOT EXISTS batches (
           id INTEGER PRIMARY KEY AUTOINCREMENT, factory_id INTEGER NOT NULL REFERENCES factories(id),
           batch_no TEXT NOT NULL, product TEXT NOT NULL, mfg_date TEXT NOT NULL, expiry_date TEXT NOT NULL,
-          state TEXT NOT NULL CHECK(state IN ('manufactured','investigation','awaiting_resample','conditional','released','rejected')),
+          state TEXT NOT NULL CHECK(state IN ('manufactured','investigation','awaiting_resample','conditional','released','rejected','pending_review')),
           revision INTEGER NOT NULL DEFAULT 1, created_by TEXT NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
           UNIQUE(factory_id,batch_no)
         );
@@ -84,13 +84,22 @@ class Store:
         CREATE TABLE IF NOT EXISTS decisions (
           id INTEGER PRIMARY KEY AUTOINCREMENT, batch_id INTEGER NOT NULL REFERENCES batches(id), revision INTEGER NOT NULL,
           decision TEXT NOT NULL CHECK(decision IN ('release','reject','conditional','resample')), rationale TEXT NOT NULL,
-          exception_code TEXT, decided_by TEXT NOT NULL, created_at TEXT NOT NULL, UNIQUE(batch_id,revision)
+          exception_code TEXT, decided_by TEXT NOT NULL, created_at TEXT NOT NULL,
+          request_no TEXT, status TEXT DEFAULT 'active', basis_json TEXT, invalid_reasons_json TEXT, invalidated_at TEXT,
+          UNIQUE(batch_id,revision)
         );
         CREATE TABLE IF NOT EXISTS audit_log (
           id INTEGER PRIMARY KEY AUTOINCREMENT, at TEXT NOT NULL, actor TEXT NOT NULL, action TEXT NOT NULL,
           entity_type TEXT NOT NULL, entity_id TEXT NOT NULL, details_json TEXT NOT NULL
         );
         """)
+        # 旧库迁移：补充凭据冻结/失效相关列
+        existing_cols = {row[1] for row in self.conn.execute("PRAGMA table_info(decisions)")}
+        for col, ddl in (("request_no", "TEXT"), ("status", "TEXT"), ("basis_json", "TEXT"),
+                         ("invalid_reasons_json", "TEXT"), ("invalidated_at", "TEXT")):
+            if col not in existing_cols:
+                self.conn.execute(f"ALTER TABLE decisions ADD COLUMN {col} {ddl}")
+        self.conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_decisions_request_no ON decisions(request_no) WHERE request_no IS NOT NULL")
         self.conn.commit()
 
     def audit(self, actor: str, action: str, entity_type: str, entity_id: object, details: dict) -> None:
@@ -149,12 +158,15 @@ class BatchService:
         actor = self._actor(actor, role, {"operator", "inspector"})
         batch = self._row("batches", batch_id); self._factory_check(actor, factory_id, batch)
         if severity not in {"critical", "minor"} or not title.strip(): raise ApiError(400, "偏差等级或描述不合法")
-        if batch["state"] in {"released", "rejected"}: raise ApiError(409, "已终态批次不能新增偏差")
+        if batch["state"] == "rejected": raise ApiError(409, "已终态批次不能新增偏差")
         with self.conn:
             cur = self.conn.execute("""INSERT INTO deviations(batch_id,severity,title,due_at,status,created_by,created_at)
                                      VALUES(?,?,?,?,'open',?,?)""", (batch_id, severity, title, due_at, actor, now()))
             self._advance_batch(batch_id, expected_revision, "investigation")
             self.store.audit(actor, "deviation.open", "deviation", cur.lastrowid, {"batch_id": batch_id, "severity": severity})
+            self._invalidate_release(actor, batch_id, "deviation.added",
+                                     f"新增偏差 #{cur.lastrowid}（{'关键' if severity == 'critical' else '一般'}）",
+                                     f"deviation:{cur.lastrowid}")
         return self._deviation_dict(self._row("deviations", cur.lastrowid))
 
     def close_deviation(self, actor: str | None, role: str | None, deviation_id: int, corrective_action: str, expected_revision: int) -> dict:
@@ -167,6 +179,7 @@ class BatchService:
                               (corrective_action, actor, now(), deviation_id))
             self._advance_batch(batch["id"], expected_revision, "investigation")
             self.store.audit(actor, "deviation.close", "deviation", deviation_id, {"batch_id": batch["id"], "corrective_action": corrective_action})
+            self._invalidate_release(actor, batch["id"], "deviation.closed", f"偏差 #{deviation_id} 已关闭", f"deviation:{deviation_id}")
         return self._deviation_dict(self._row("deviations", deviation_id))
 
     def approve_exception(self, actor: str | None, role: str | None, deviation_id: int, reason: str, until: str, expected_revision: int) -> dict:
@@ -178,13 +191,14 @@ class BatchService:
             self.conn.execute("UPDATE deviations SET exception_reason=?,exception_until=?,exception_approved_by=? WHERE id=?", (reason, until, actor, deviation_id))
             self._advance_batch(batch["id"], expected_revision, batch["state"])
             self.store.audit(actor, "deviation.exception", "deviation", deviation_id, {"batch_id": batch["id"], "reason": reason, "until": until})
+            self._invalidate_release(actor, batch["id"], "deviation.exception", f"偏差 #{deviation_id} 例外批准至 {until}", f"deviation:{deviation_id}")
         return self._deviation_dict(self._row("deviations", deviation_id))
 
     def record_test(self, actor: str | None, role: str | None, factory_id: int, batch_id: int, test_type: str, result: float, spec_min: float, spec_max: float, expected_revision: int) -> dict:
         actor = self._actor(actor, role, {"lab"})
         batch = self._row("batches", batch_id); self._factory_check(actor, factory_id, batch)
         if not test_type.strip() or spec_min > spec_max: raise ApiError(400, "检验项目或标准不合法")
-        if batch["state"] in {"released", "rejected"}: raise ApiError(409, "终态批次不能补录检验")
+        if batch["state"] == "rejected": raise ApiError(409, "终态批次不能补录检验")
         round_no = self.conn.execute("SELECT COALESCE(MAX(round),0)+1 FROM tests WHERE batch_id=? AND test_type=?", (batch_id, test_type)).fetchone()[0]
         passed = int(spec_min <= result <= spec_max)
         with self.conn:
@@ -192,16 +206,20 @@ class BatchService:
                                      VALUES(?,?,?,?,?,?,?,?,?)""", (batch_id, test_type, result, spec_min, spec_max, passed, round_no, actor, now()))
             self._advance_batch(batch_id, expected_revision, "investigation" if (batch["state"] == "awaiting_resample" or not passed) else batch["state"])
             self.store.audit(actor, "test.record", "batch", batch_id, {"test_type": test_type, "result": result, "passed": bool(passed), "round": round_no})
+            self._invalidate_release(actor, batch_id, "test.recorded",
+                                     f"补录检验 {test_type} 第{round_no}轮（{'合格' if passed else '不合格'}）",
+                                     f"test:{cur.lastrowid}")
         return self._test_dict(self._row("tests", cur.lastrowid))
 
     def plan_rework(self, actor: str | None, role: str | None, factory_id: int, batch_id: int, description: str, expected_revision: int) -> dict:
         actor = self._actor(actor, role, {"operator"})
         batch = self._row("batches", batch_id); self._factory_check(actor, factory_id, batch)
-        if batch["state"] in {"released", "rejected"}: raise ApiError(409, "终态批次不能返工")
+        if batch["state"] == "rejected": raise ApiError(409, "终态批次不能返工")
         with self.conn:
             cur = self.conn.execute("INSERT INTO rework(batch_id,description,status,created_by,created_at) VALUES(?,?,'planned',?,?)", (batch_id, description, actor, now()))
             self._advance_batch(batch_id, expected_revision, "investigation")
             self.store.audit(actor, "rework.plan", "rework", cur.lastrowid, {"batch_id": batch_id, "description": description})
+            self._invalidate_release(actor, batch_id, "rework.planned", f"新增返工 #{cur.lastrowid}", f"rework:{cur.lastrowid}")
         return dict(self._row("rework", cur.lastrowid))
 
     def complete_rework(self, actor: str | None, role: str | None, factory_id: int, rework_id: int, expected_revision: int) -> dict:
@@ -212,6 +230,7 @@ class BatchService:
             self.conn.execute("UPDATE rework SET status='completed',completed_by=?,completed_at=? WHERE id=?", (actor, now(), rework_id))
             self._advance_batch(batch["id"], expected_revision, "investigation")
             self.store.audit(actor, "rework.complete", "rework", rework_id, {"batch_id": batch["id"]})
+            self._invalidate_release(actor, batch["id"], "rework.completed", f"返工 #{rework_id} 已完成", f"rework:{rework_id}")
         return dict(self._row("rework", rework_id))
 
     def record_supplier_change(self, actor: str | None, role: str | None, factory_id: int, batch_id: int, supplier: str, change_type: str, description: str, expected_revision: int) -> dict:
@@ -222,6 +241,8 @@ class BatchService:
                                     (batch_id, supplier, change_type, description, actor, now()))
             self._advance_batch(batch_id, expected_revision, "investigation")
             self.store.audit(actor, "supplier_change.record", "batch", batch_id, {"supplier": supplier, "change_type": change_type})
+            self._invalidate_release(actor, batch_id, "supplier_change.recorded",
+                                     f"新增供应商变更 #{cur.lastrowid}（{supplier}）", f"supplier_change:{cur.lastrowid}")
         return dict(self._row("supplier_changes", cur.lastrowid))
 
     def record_stability(self, actor: str | None, role: str | None, factory_id: int, batch_id: int, condition: str, timepoint: str, result: float, spec_limit: float, expected_revision: int) -> dict:
@@ -233,53 +254,131 @@ class BatchService:
                                     (batch_id, condition, timepoint, result, spec_limit, passed, actor, now()))
             self._advance_batch(batch_id, expected_revision, batch["state"])
             self.store.audit(actor, "stability.record", "batch", batch_id, {"condition": condition, "timepoint": timepoint, "passed": bool(passed)})
+            self._invalidate_release(actor, batch_id, "stability.recorded",
+                                     f"新增稳定性记录 #{cur.lastrowid}（{condition} {timepoint}）", f"stability:{cur.lastrowid}")
         return dict(self._row("stability", cur.lastrowid))
 
-    def decide(self, actor: str | None, role: str | None, batch_id: int, decision: str, rationale: str, expected_revision: int, exception_code: str = "") -> dict:
+    def decide(self, actor: str | None, role: str | None, batch_id: int, decision: str, rationale: str, expected_revision: int, exception_code: str = "", request_no: str = "") -> dict:
         actor = self._actor(actor, role, {"qa"})
         batch = self._row("batches", batch_id)
         if decision not in {"release", "reject", "conditional", "resample"}: raise ApiError(400, "放行决定不合法")
+        if not rationale.strip(): raise ApiError(400, "必须填写决定依据")
+        request_no = (request_no or "").strip()
+        # 同一请求编号重试：幂等返回已签发凭据；凭据已失效则要求换新编号
+        if request_no:
+            prior = self.conn.execute("SELECT * FROM decisions WHERE request_no=?", (request_no,)).fetchone()
+            if prior:
+                if prior["batch_id"] == batch_id and prior["decision"] == decision:
+                    if prior["decision"] in {"release", "conditional"} and prior["status"] != "active":
+                        raise ApiError(409, "请求编号对应的凭据已失效或批次已变更，请使用新请求编号重新发起")
+                    return {"decision": self._decision_dict(prior), "batch": self.batch_detail(batch_id)["batch"]}
+                raise ApiError(409, "请求编号已被其他决定使用")
         if batch["state"] in {"released", "rejected"}: raise ApiError(409, "批次已经是终态")
         if int(expected_revision) != int(batch["revision"]): raise ApiError(409, "批次已被其他工厂或质量人员修改，请刷新版本")
-        if not rationale.strip(): raise ApiError(400, "必须填写决定依据")
-        deviations = self.conn.execute("SELECT * FROM deviations WHERE batch_id=? ORDER BY id", (batch_id,)).fetchall()
-        open_deviations = [d for d in deviations if d["status"] == "open"]
-        latest_tests: dict[str, sqlite3.Row] = {}
-        for row in self.conn.execute("SELECT * FROM tests WHERE batch_id=? ORDER BY id", (batch_id,)):
-            latest_tests[row["test_type"]] = row
-        if decision in {"release", "conditional"} and not latest_tests:
-            raise ApiError(409, "放行前至少需要一项检验结果")
-        if decision in {"release", "conditional"} and any(not row["passed"] for row in latest_tests.values()):
-            raise ApiError(409, "最新检验结果仍有不合格项")
-        if decision == "resample":
-            if batch["state"] == "conditional": raise ApiError(409, "有条件放行后不能直接改为再取样")
-            new_state = "awaiting_resample"
-        elif decision == "reject":
-            new_state = "rejected"
-        elif any(d["severity"] == "critical" for d in open_deviations):
-            raise ApiError(409, "未关闭的关键偏差阻止放行")
-        elif decision == "release" and open_deviations:
-            raise ApiError(409, "仍有未关闭偏差，不能正式放行")
-        elif decision == "conditional":
-            for deviation in open_deviations:
-                if not deviation["exception_reason"] or not after_now(deviation["exception_until"]):
-                    raise ApiError(409, f"偏差 {deviation['id']} 没有有效例外批准")
-            if not exception_code.strip(): raise ApiError(400, "有条件放行必须提供例外编号")
-            new_state = "conditional"
-        else:
-            new_state = "released"
+        if decision == "resample" and batch["state"] == "conditional": raise ApiError(409, "有条件放行后不能直接改为再取样")
+        new_state = {"release": "released", "reject": "rejected", "conditional": "conditional", "resample": "awaiting_resample"}[decision]
+        blockers: list[dict] = []
+        basis: dict | None = None
+        status = None
+        if decision in {"release", "conditional"}:
+            blockers = self._release_blockers(batch, decision, exception_code)
+            if blockers:
+                raise ApiError(409, "放行条件不满足：" + "；".join(b["message"] for b in blockers), {"blockers": blockers})
+            basis = self._freeze_basis(batch_id)
+            status = "active"
         with self.conn:
-            cur = self.conn.execute("""INSERT INTO decisions(batch_id,revision,decision,rationale,exception_code,decided_by,created_at)
-                                     VALUES(?,?,?,?,?,?,?)""", (batch_id, batch["revision"], decision, rationale, exception_code or None, actor, now()))
+            cur = self.conn.execute("""INSERT INTO decisions(batch_id,revision,decision,rationale,exception_code,decided_by,created_at,request_no,status,basis_json)
+                                     VALUES(?,?,?,?,?,?,?,?,?,?)""",
+                                    (batch_id, batch["revision"], decision, rationale, exception_code or None, actor, now(),
+                                     request_no or None, status, json.dumps(basis, ensure_ascii=False) if basis else None))
             updated = self.conn.execute("UPDATE batches SET state=?,revision=revision+1,updated_at=? WHERE id=? AND revision=?",
                                         (new_state, now(), batch_id, expected_revision))
             if updated.rowcount != 1: raise ApiError(409, "并发放行冲突")
-            self.store.audit(actor, "batch.decision", "batch", batch_id, {"decision": decision, "revision": batch["revision"], "state": new_state, "exception_code": exception_code})
-        return {"decision": dict(self._row("decisions", cur.lastrowid)), "batch": self.batch_detail(batch_id)["batch"]}
+            self.store.audit(actor, "batch.decision", "batch", batch_id,
+                             {"decision": decision, "revision": batch["revision"], "state": new_state,
+                              "exception_code": exception_code, "request_no": request_no})
+        return {"decision": self._decision_dict(self._row("decisions", cur.lastrowid)), "batch": self.batch_detail(batch_id)["batch"]}
+
+    def _release_blockers(self, batch: sqlite3.Row, decision: str, exception_code: str) -> list[dict]:
+        """汇总放行/有条件放行的全部阻塞项，便于接口与页面一次性列出。"""
+        blockers: list[dict] = []
+        rows = lambda name: self.conn.execute(f"SELECT * FROM {name} WHERE batch_id=? ORDER BY id", (batch["id"],)).fetchall()
+        deviations, tests = rows("deviations"), rows("tests")
+        open_deviations = [d for d in deviations if d["status"] == "open"]
+        latest_tests: dict[str, sqlite3.Row] = {}
+        for t in tests: latest_tests[t["test_type"]] = t
+        if not latest_tests:
+            blockers.append({"code": "no_tests", "message": "放行前至少需要一项检验结果"})
+        failed = [t for t in latest_tests.values() if not t["passed"]]
+        if failed:
+            blockers.append({"code": "test_failed", "message": "最新检验结果仍有不合格项：" + "、".join(t["test_type"] for t in failed)})
+        critical = [d for d in open_deviations if d["severity"] == "critical"]
+        if critical:
+            blockers.append({"code": "critical_deviation",
+                             "message": "未关闭的关键偏差阻止放行：" + "、".join(f"#{d['id']}" for d in critical)})
+        if decision == "release":
+            minor = [d for d in open_deviations if d["severity"] == "minor"]
+            if minor:
+                blockers.append({"code": "open_deviation",
+                                 "message": "仍有未关闭偏差，不能正式放行：" + "、".join(f"#{d['id']}" for d in minor)})
+        if decision == "conditional":
+            for d in open_deviations:
+                if not d["exception_reason"] or not after_now(d["exception_until"]):
+                    blockers.append({"code": "no_exception", "message": f"偏差 #{d['id']} 没有有效例外批准"})
+            if not exception_code.strip():
+                blockers.append({"code": "no_exception_code", "message": "有条件放行必须提供例外编号"})
+        return blockers
+
+    def _freeze_basis(self, batch_id: int) -> dict:
+        rows = lambda name: [dict(r) for r in self.conn.execute(f"SELECT * FROM {name} WHERE batch_id=? ORDER BY id", (batch_id,))]
+        return {"revision": self._row("batches", batch_id)["revision"],
+                "deviations": rows("deviations"), "tests": rows("tests"),
+                "rework": rows("rework"), "supplier_changes": rows("supplier_changes"), "stability": rows("stability")}
+
+    def _invalidate_release(self, actor: str, batch_id: int, reason_code: str, reason_message: str, ref: str = "") -> None:
+        """任一依据变化后，作废该批次最新放行/有条件放行凭据，并把批次退回待复核。"""
+        row = self.conn.execute("""SELECT * FROM decisions WHERE batch_id=? AND decision IN ('release','conditional')
+                                   ORDER BY id DESC LIMIT 1""", (batch_id,)).fetchone()
+        if not row: return
+        reasons: list[dict] = []
+        try: reasons = json.loads(row["invalid_reasons_json"]) if row["invalid_reasons_json"] else []
+        except (TypeError, json.JSONDecodeError): reasons = []
+        reasons.append({"code": reason_code, "message": reason_message, "ref": ref})
+        stamp = now()
+        if row["status"] == "active":
+            self.conn.execute("UPDATE decisions SET status='invalid',invalid_reasons_json=?,invalidated_at=? WHERE id=?",
+                              (json.dumps(reasons, ensure_ascii=False), stamp, row["id"]))
+            self.conn.execute("UPDATE batches SET state='pending_review',updated_at=? WHERE id=?", (stamp, batch_id))
+            self.store.audit(actor, "decision.invalidate", "decision", row["id"],
+                             {"batch_id": batch_id, "reasons": reasons})
+        elif row["status"] == "invalid":
+            self.conn.execute("UPDATE decisions SET invalid_reasons_json=?,invalidated_at=? WHERE id=?",
+                              (json.dumps(reasons, ensure_ascii=False), stamp, row["id"]))
+            self.conn.execute("UPDATE batches SET state='pending_review',updated_at=? WHERE id=?", (stamp, batch_id))
+
+    def release_check(self, batch_id: int, decision: str = "release") -> dict:
+        batch = self._row("batches", batch_id)
+        if decision not in {"release", "conditional"}: decision = "release"
+        return {"batch_id": batch_id, "decision": decision, "blockers": self._release_blockers(batch, decision, "")}
+
+    def _active_credential(self, batch_id: int) -> dict | None:
+        row = self.conn.execute("""SELECT * FROM decisions WHERE batch_id=? AND decision IN ('release','conditional')
+                                   ORDER BY id DESC LIMIT 1""", (batch_id,)).fetchone()
+        return self._decision_dict(row) if row else None
+
+    @staticmethod
+    def _decision_dict(row: sqlite3.Row) -> dict:
+        d = dict(row)
+        try: d["basis"] = json.loads(row["basis_json"]) if row["basis_json"] else None
+        except (TypeError, json.JSONDecodeError): d["basis"] = None
+        try: d["invalid_reasons"] = json.loads(row["invalid_reasons_json"]) if row["invalid_reasons_json"] else []
+        except (TypeError, json.JSONDecodeError): d["invalid_reasons"] = []
+        d.pop("basis_json", None); d.pop("invalid_reasons_json", None)
+        return d
 
     def _advance_batch(self, batch_id: int, expected_revision: int, next_state: str) -> None:
         batch = self._row("batches", batch_id)
-        if batch["state"] in {"released", "rejected"}: raise ApiError(409, "终态批次不可修改")
+        if batch["state"] == "rejected": raise ApiError(409, "终态批次不可修改")
         if int(expected_revision) != int(batch["revision"]): raise ApiError(409, "批次版本冲突")
         cur = self.conn.execute("UPDATE batches SET state=?,revision=revision+1,updated_at=? WHERE id=? AND revision=?",
                                 (next_state, now(), batch_id, expected_revision))
@@ -288,9 +387,10 @@ class BatchService:
     def batch_detail(self, batch_id: int) -> dict:
         batch = self._batch_dict(self._row("batches", batch_id))
         def rows(name: str) -> list[dict]: return [dict(row) for row in self.conn.execute(f"SELECT * FROM {name} WHERE batch_id=? ORDER BY id", (batch_id,))]
+        decisions = [self._decision_dict(row) for row in self.conn.execute("SELECT * FROM decisions WHERE batch_id=? ORDER BY id", (batch_id,))]
         return {"batch": batch, "deviations": rows("deviations"), "tests": rows("tests"), "rework": rows("rework"),
                 "supplier_changes": rows("supplier_changes"), "stability": rows("stability"),
-                "decisions": rows("decisions")}
+                "decisions": decisions, "active_credential": self._active_credential(batch_id)}
 
     def _batch_dict(self, row: sqlite3.Row) -> dict:
         return {"id": row["id"], "factory_id": row["factory_id"], "batch_no": row["batch_no"], "product": row["product"],
@@ -308,8 +408,10 @@ class BatchService:
                 "spec_min": row["spec_min"], "spec_max": row["spec_max"], "passed": bool(row["passed"]), "round": row["round"]}
 
     def state(self) -> dict:
+        batches = [self._batch_dict(row) for row in self.conn.execute("SELECT * FROM batches ORDER BY id DESC")]
         return {"factories": [dict(row) for row in self.conn.execute("SELECT * FROM factories ORDER BY id")],
-                "batches": [self._batch_dict(row) for row in self.conn.execute("SELECT * FROM batches ORDER BY id DESC")],
+                "batches": batches,
+                "credentials": [c for c in (self._active_credential(b["id"]) for b in batches) if c],
                 "audits": [dict(row) for row in self.conn.execute("SELECT * FROM audit_log ORDER BY id DESC LIMIT 30")]}
 
     def seed(self) -> None:
@@ -335,11 +437,14 @@ class Handler(BaseHTTPRequestHandler):
             if p in (["health"], ["api", "health"]): out = {"status": "ok"}
             elif p == ["api", "state"]: out = self.service.state()
             elif len(p) == 3 and p[:2] == ["api", "batches"]: out = self.service.batch_detail(int(p[2]))
+            elif len(p) == 4 and p[:2] == ["api", "batches"] and p[3] == "release-check":
+                qs = parse_qs(urlparse(self.path).query); out = self.service.release_check(int(p[2]), qs.get("decision", ["release"])[0])
             elif not p:
                 page = (Path(__file__).parent / "static" / "index.html").read_bytes(); self.send_response(200); self.send_header("Content-Type", "text/html; charset=utf-8"); self.send_header("Content-Length", str(len(page))); self.end_headers(); self.wfile.write(page); return
             else: raise ApiError(404, "接口不存在")
             self._send(200, out)
-        except ApiError as exc: self._send(exc.status, {"error": exc.message})
+        except ApiError as exc:
+            body = {"error": exc.message}; body.update(exc.payload); self._send(exc.status, body)
         except Exception as exc: self._send(500, {"error": str(exc)})
 
     def do_POST(self) -> None:
@@ -355,10 +460,11 @@ class Handler(BaseHTTPRequestHandler):
             elif len(p) == 4 and p[:2] == ["api", "rework"] and p[3] == "complete": out = self.service.complete_rework(actor, role, int(b.get("factory_id", 0)), int(p[2]), int(b.get("expected_revision", -1)))
             elif len(p) == 4 and p[:2] == ["api", "batches"] and p[3] == "supplier-changes": out = self.service.record_supplier_change(actor, role, int(b.get("factory_id", 0)), int(p[2]), b.get("supplier", ""), b.get("change_type", ""), b.get("description", ""), int(b.get("expected_revision", -1)))
             elif len(p) == 4 and p[:2] == ["api", "batches"] and p[3] == "stability": out = self.service.record_stability(actor, role, int(b.get("factory_id", 0)), int(p[2]), b.get("condition", ""), b.get("timepoint", ""), float(b.get("result", 0)), float(b.get("spec_limit", 0)), int(b.get("expected_revision", -1)))
-            elif len(p) == 4 and p[:2] == ["api", "batches"] and p[3] == "decide": out = self.service.decide(actor, role, int(p[2]), b.get("decision", ""), b.get("rationale", ""), int(b.get("expected_revision", -1)), b.get("exception_code", ""))
+            elif len(p) == 4 and p[:2] == ["api", "batches"] and p[3] == "decide": out = self.service.decide(actor, role, int(p[2]), b.get("decision", ""), b.get("rationale", ""), int(b.get("expected_revision", -1)), b.get("exception_code", ""), b.get("request_no", ""))
             else: raise ApiError(404, "接口不存在")
             self._send(200, out)
-        except ApiError as exc: self._send(exc.status, {"error": exc.message})
+        except ApiError as exc:
+            body = {"error": exc.message}; body.update(exc.payload); self._send(exc.status, body)
         except (ValueError, TypeError, sqlite3.IntegrityError) as exc: self._send(400, {"error": str(exc)})
         except Exception as exc: self._send(500, {"error": str(exc)})
 

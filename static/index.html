@@ -1,1 +1,160 @@
-<!doctype html><html lang="zh-CN"><meta charset="utf-8"><title>批次放行</title><style>body{font:16px system-ui;max-width:1100px;margin:32px auto;padding:0 20px}pre{background:#f3f5f7;padding:16px;overflow:auto}button{padding:8px 14px}</style><h1>药品生产偏差与批次放行</h1><p>偏差、检验、返工、供应商变更和稳定性数据共同约束质量放行。</p><button onclick="loadState()">刷新状态</button><pre id="state">加载中...</pre><script>async function loadState(){state.textContent=JSON.stringify(await (await fetch('/api/state')).json(),null,2)}loadState()</script></html>
+<!doctype html>
+<html lang="zh-CN">
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>批次放行</title>
+<style>
+  :root { --ok:#1a7f37; --bad:#cf222e; --warn:#9a6700; --line:#d0d7de; }
+  * { box-sizing: border-box; }
+  body { font:15px system-ui,-apple-system,"Segoe UI",sans-serif; max-width:1180px; margin:24px auto; padding:0 20px; color:#1f2328; }
+  h1 { font-size:22px; }
+  .toolbar { display:flex; gap:8px; align-items:center; margin:12px 0; }
+  button { padding:6px 12px; border:1px solid var(--line); border-radius:6px; background:#f6f8fa; cursor:pointer; font-size:14px; }
+  button:hover { background:#eaeef2; }
+  button.primary { background:#1f6feb; color:#fff; border-color:#1f6feb; }
+  button.primary:hover { background:#1a5cd7; }
+  table { width:100%; border-collapse:collapse; margin:12px 0; background:#fff; }
+  th,td { border:1px solid var(--line); padding:8px 10px; text-align:left; vertical-align:top; }
+  th { background:#f6f8fa; }
+  .badge { display:inline-block; padding:2px 8px; border-radius:10px; font-size:12px; font-weight:600; }
+  .badge.ok { background:#dafbe1; color:var(--ok); }
+  .badge.bad { background:#ffebe9; color:var(--bad); }
+  .badge.none { background:#eaeef2; color:#57606a; }
+  .badge.warn { background:#fff8c5; color:var(--warn); }
+  ul.reasons, ul.blockers { margin:4px 0; padding-left:18px; }
+  ul.blockers li { color:var(--bad); }
+  ul.reasons li { color:var(--warn); }
+  .muted { color:#57606a; font-size:13px; }
+  .panel { border:1px solid var(--line); border-radius:8px; padding:14px; margin:12px 0; background:#fff; }
+  .panel h3 { margin:0 0 8px; font-size:16px; }
+  label { display:block; font-size:13px; margin:6px 0 2px; color:#57606a; }
+  input,select,textarea { width:100%; padding:6px 8px; border:1px solid var(--line); border-radius:6px; font-size:14px; }
+  .row2 { display:grid; grid-template-columns:1fr 1fr; gap:10px; }
+  .result { margin-top:8px; font-size:14px; }
+  .result.err { color:var(--bad); }
+  .result.ok { color:var(--ok); }
+  code { background:#f6f8fa; padding:1px 5px; border-radius:4px; font-size:13px; }
+</style>
+<h1>药品生产偏差与批次放行</h1>
+<p class="muted">质量人员签发放行凭据时冻结批次修订及偏差、检验、返工、供应商变更和稳定性清单；任一依据变化即作废凭据并退回待复核。接口与页面均列出阻塞项与失效原因。</p>
+<div class="toolbar">
+  <button onclick="loadState()">刷新状态</button>
+  <span class="muted">身份：<code>X-Actor</code> / <code>X-Role</code>（qa 可签发）</span>
+</div>
+
+<div id="batches"></div>
+
+<div class="panel">
+  <h3>签发 / 复核放行决定</h3>
+  <div class="row2">
+    <div><label>批次 ID</label><input id="d-batch" type="number" placeholder="批次 ID"></div>
+    <div><label>决定</label>
+      <select id="d-decision">
+        <option value="release">release 正式放行</option>
+        <option value="conditional">conditional 有条件放行</option>
+        <option value="resample">resample 再取样</option>
+        <option value="reject">reject 拒绝</option>
+      </select>
+    </div>
+  </div>
+  <label>决定依据</label><textarea id="d-rationale" rows="2" placeholder="必须填写决定依据"></textarea>
+  <div class="row2">
+    <div><label>例外编号（有条件放行必填）</label><input id="d-exc" placeholder="EXC-..."></div>
+    <div><label>请求编号（重试沿用同一编号）</label><input id="d-req" placeholder="REQ-..."></div>
+  </div>
+  <div class="row2">
+    <div><label>当前批次修订号</label><input id="d-rev" type="number" placeholder="expected_revision"></div>
+    <div style="display:flex;align-items:flex-end;gap:8px;">
+      <button class="primary" onclick="submitDecide()">提交决定</button>
+      <button onclick="checkBlockers()">检查阻塞项</button>
+    </div>
+  </div>
+  <div id="d-result" class="result"></div>
+</div>
+
+<script>
+const $ = id => document.getElementById(id);
+function esc(s){ return String(s ?? '').replace(/[&<>"]/g, c => ({'&':'&','<':'<','>':'>','"':'"'}[c])); }
+
+async function loadState(){
+  const state = await (await fetch('/api/state')).json();
+  const credByBatch = {};
+  for (const c of (state.credentials || [])) credByBatch[c.batch_id] = c;
+  const html = ['<table><thead><tr><th>批号 / 产品</th><th>工厂</th><th>状态</th><th>修订</th><th>凭据</th><th>失效原因</th><th>阻塞项</th></tr></thead><tbody>'];
+  for (const b of state.batches){
+    const cred = credByBatch[b.id];
+    let credBadge = '<span class="badge none">无凭据</span>';
+    let reasons = '<span class="muted">—</span>';
+    if (cred){
+      if (cred.status === 'active') credBadge = '<span class="badge ok">有效</span>';
+      else if (cred.status === 'invalid') credBadge = '<span class="badge bad">已失效</span>';
+      else credBadge = '<span class="badge none">'+esc(cred.decision)+'</span>';
+      if (cred.status === 'invalid' && cred.invalid_reasons && cred.invalid_reasons.length){
+        reasons = '<ul class="reasons">' + cred.invalid_reasons.map(r => '<li>'+esc(r.message)+'</li>').join('') + '</ul>';
+      } else reasons = '<span class="muted">签发于修订 '+esc(cred.revision)+'（'+esc(cred.decided_by)+'）</span>';
+    }
+    html.push('<tr><td><b>'+esc(b.batch_no)+'</b><br><span class="muted">'+esc(b.product)+'</span></td>'
+      + '<td>'+esc(b.factory_id)+'</td>'
+      + '<td>'+esc(b.state)+'</td>'
+      + '<td>'+esc(b.revision)+'</td>'
+      + '<td>'+credBadge+'</td>'
+      + '<td>'+reasons+'</td>'
+      + '<td><button onclick="checkBlockersFor('+b.id+')">检查</button> <span id="blk-'+b.id+'"></span></td></tr>');
+  }
+  html.push('</tbody></table>');
+  $('batches').innerHTML = html.join('');
+}
+
+async function checkBlockersFor(batchId){
+  const el = $('blk-'+batchId);
+  el.innerHTML = '<span class="muted">…</span>';
+  try {
+    const r = await fetch('/api/batches/'+batchId+'/release-check?decision=release');
+    const body = await r.json();
+    if (!r.ok){ el.innerHTML = '<span class="muted">'+esc(body.error)+'</span>'; return; }
+    if (!body.blockers.length) el.innerHTML = '<span class="badge ok">可放行</span>';
+    else el.innerHTML = '<ul class="blockers">'+body.blockers.map(x => '<li>'+esc(x.message)+'</li>').join('')+'</ul>';
+  } catch(e){ el.innerHTML = '<span class="muted">'+esc(e)+'</span>'; }
+}
+
+async function checkBlockers(){
+  const batchId = $('d-batch').value;
+  if (!batchId){ $('d-result').className='result err'; $('d-result').textContent='请填写批次 ID'; return; }
+  const r = await fetch('/api/batches/'+batchId+'/release-check?decision='+$('d-decision').value);
+  const body = await r.json();
+  if (!r.ok){ $('d-result').className='result err'; $('d-result').textContent = body.error; return; }
+  $('d-result').className='result '+(body.blockers.length?'err':'ok');
+  $('d-result').innerHTML = body.blockers.length
+    ? '阻塞项：<ul class="blockers">'+body.blockers.map(x=>'<li>'+esc(x.message)+'</li>').join('')+'</ul>'
+    : '无阻塞项，可以放行。';
+}
+
+async function submitDecide(){
+  const batchId = $('d-batch').value;
+  const payload = {
+    decision: $('d-decision').value,
+    rationale: $('d-rationale').value,
+    exception_code: $('d-exc').value,
+    request_no: $('d-req').value,
+    expected_revision: Number($('d-rev').value || -1)
+  };
+  const r = await fetch('/api/batches/'+batchId+'/decide', {
+    method:'POST', headers:{'Content-Type':'application/json','X-Actor':'qa-web','X-Role':'qa'},
+    body: JSON.stringify(payload)
+  });
+  const body = await r.json();
+  if (!r.ok){
+    $('d-result').className='result err';
+    let html = '失败：'+esc(body.error);
+    if (body.blockers && body.blockers.length) html += '<ul class="blockers">'+body.blockers.map(x=>'<li>'+esc(x.message)+'</li>').join('')+'</ul>';
+    $('d-result').innerHTML = html;
+  } else {
+    $('d-result').className='result ok';
+    $('d-result').textContent = '已签发：'+body.decision.decision+'，批次状态 '+body.batch.state+'，凭据状态 '+(body.decision.status||'—');
+    loadState();
+  }
+}
+
+loadState();
+</script>
+</html>
